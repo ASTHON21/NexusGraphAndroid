@@ -1,0 +1,310 @@
+name: Android & Web to APK Cloud Compiler
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: "应用名称 (仅在将网页/网址打包为APK时生效)"
+        required: false
+        default: "MyWebApp"
+      app_id:
+        description: "应用包名 Application ID (仅在网页转APK时生效)"
+        required: false
+        default: "com.example.webapp"
+      web_url:
+        description: "在线网址 (留空则自动打包仓库内的源码或ZIP包)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. 检出仓库文件 (Checkout Repository)
+        uses: actions/checkout@v4
+
+      - name: 2. 自动检测并解压上传的 ZIP 源码包 (Auto-Unzip Project Archive)
+        shell: bash
+        run: |
+          set -e
+          shopt -s nullglob
+          zip_files=(*.zip)
+          if [ ${#zip_files[@]} -gt 0 ]; then
+            echo "检测到根目录存在 ZIP 压缩包: ${zip_files[0]}，正在云端自动解压..."
+            mkdir -p _unzipped_src
+            unzip -q -o "${zip_files[0]}" -d _unzipped_src
+            # 如果解压后只有一个顶层文件夹，则将其内部文件移动到工作目录
+            entries=("_unzipped_src"/*)
+            if [ ${#entries[@]} -eq 1 ] && [ -d "${entries[0]}" ]; then
+              cp -rn "${entries[0]}"/. .
+            else
+              cp -rn _unzipped_src/. .
+            fi
+            rm -rf _unzipped_src
+            echo "ZIP 解压完成。"
+          fi
+
+      - name: 3. 识别项目类型 (Detect Android Gradle vs Web HTML/JS/React)
+        id: detect
+        shell: bash
+        run: |
+          set -e
+          # 查找是否存在 Android 项目的 build.gradle 或 AndroidManifest.xml
+          manifest_path=$(find . -maxdepth 4 -name "AndroidManifest.xml" | head -n 1 || true)
+          if [ -n "${{ github.event.inputs.web_url }}" ]; then
+            echo "mode=web" >> $GITHUB_OUTPUT
+            echo "检测到输入了在线网址，将使用 WebView 容器编译 APK。"
+          elif [ -n "$manifest_path" ]; then
+            # 定位包含 settings.gradle(.kts) 或 build.gradle(.kts) 的根目录
+            proj_dir=$(dirname $(dirname $(dirname $(dirname "$manifest_path"))))
+            echo "mode=android" >> $GITHUB_OUTPUT
+            echo "project_dir=$proj_dir" >> $GITHUB_OUTPUT
+            echo "检测到原生 Android (Java/Kotlin) 工程，目录: $proj_dir"
+          else
+            echo "mode=web" >> $GITHUB_OUTPUT
+            echo "未检测到原生 AndroidManifest.xml，将按网页 (HTML/JS/React) 项目自动封装为 APK。"
+          fi
+
+      - name: 4. 构建前端网页资源 (Build Web Assets if package.json exists)
+        if: steps.detect.outputs.mode == 'web'
+        shell: bash
+        run: |
+          set -e
+          mkdir -p _web_dist
+          if [ -n "${{ github.event.inputs.web_url }}" ]; then
+            echo "${{ github.event.inputs.web_url }}" > _web_dist/target_url.txt
+          elif [ -f "url.txt" ]; then
+            cp url.txt _web_dist/target_url.txt
+          elif [ -f "package.json" ]; then
+            echo "检测到 package.json (例如 Google AI Studio Web/React 导出项目)，正在编译前端..."
+            npm install --legacy-peer-deps
+            # 针对 Vite 项目使用相对路径构建
+            npx vite build --base=./ || npm run build
+            if [ -d "dist" ]; then
+              cp -r dist/* _web_dist/
+            elif [ -d "build" ]; then
+              cp -r build/* _web_dist/
+            fi
+          else
+            echo "复制纯静态 HTML/CSS/JS 文件..."
+            if [ -d "www" ] && [ -f "www/index.html" ]; then
+              cp -r www/* _web_dist/
+            else
+              find . -maxdepth 2 \( -name "*.html" -o -name "*.css" -o -name "*.js" -o -name "*.png" -o -name "*.jpg" -o -name "*.svg" -o -name "*.json" \) -not -path "./.git/*" -not -path "./_web_dist/*" -exec cp --parents {} _web_dist/ \;
+            fi
+          fi
+
+      - name: 5. 生成 Android WebView 工程骨架 (Generate WebView APK Project)
+        if: steps.detect.outputs.mode == 'web'
+        shell: bash
+        run: |
+          set -e
+          APP_NAME="${{ github.event.inputs.app_name || 'MyWebApp' }}"
+          APP_ID="${{ github.event.inputs.app_id || 'com.example.webapp' }}"
+          mkdir -p _android_webview/app/src/main/java/com/example/webapp
+          mkdir -p _android_webview/app/src/main/res/values
+          mkdir -p _android_webview/app/src/main/assets/www
+
+          cp -r _web_dist/* _android_webview/app/src/main/assets/www/ 2>/dev/null || true
+
+          cat << 'GRADLE_SETTINGS' > _android_webview/settings.gradle.kts
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "WebViewApp"
+          include(":app")
+          GRADLE_SETTINGS
+
+          cat << 'GRADLE_ROOT' > _android_webview/build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.2.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+          }
+          GRADLE_ROOT
+
+          cat << 'GRADLE_PROPS' > _android_webview/gradle.properties
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          GRADLE_PROPS
+
+          cat << GRADLE_APP > _android_webview/app/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.webapp"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "$APP_ID"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          dependencies {
+              implementation("androidx.appcompat:appcompat:1.6.1")
+              implementation("androidx.webkit:webkit:1.10.0")
+          }
+          GRADLE_APP
+
+          cat << MANIFEST > _android_webview/app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:allowBackup="true"
+                  android:label="$APP_NAME"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@style/Theme.AppCompat.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:configChanges="orientation|screenSize|keyboardHidden"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          MANIFEST
+
+          cat << 'MAIN_KT' > _android_webview/app/src/main/java/com/example/webapp/MainActivity.kt
+          package com.example.webapp
+
+          import android.annotation.SuppressLint
+          import android.os.Bundle
+          import android.webkit.WebResourceRequest
+          import android.webkit.WebResourceResponse
+          import android.webkit.WebSettings
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import androidx.activity.OnBackPressedCallback
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.webkit.WebViewAssetLoader
+          import java.io.BufferedReader
+          import java.io.InputStreamReader
+
+          class MainActivity : AppCompatActivity() {
+              private lateinit var webView: WebView
+
+              @SuppressLint("SetJavaScriptEnabled")
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  webView = WebView(this)
+                  setContentView(webView)
+
+                  val assetLoader = WebViewAssetLoader.Builder()
+                      .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(this))
+                      .build()
+
+                  webView.settings.apply {
+                      javaScriptEnabled = true
+                      domStorageEnabled = true
+                      allowFileAccess = true
+                      allowContentAccess = true
+                      mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                  }
+
+                  webView.webViewClient = object : WebViewClient() {
+                      override fun shouldInterceptRequest(
+                          view: WebView,
+                          request: WebResourceRequest
+                      ): WebResourceResponse? {
+                          return assetLoader.shouldInterceptRequest(request.url)
+                      }
+                  }
+
+                  val targetUrl = try {
+                      assets.open("www/target_url.txt").use { stream ->
+                          BufferedReader(InputStreamReader(stream)).readLine()?.trim()
+                      }
+                  } catch (e: Exception) {
+                      null
+                  }
+
+                  if (!targetUrl.isNullOrEmpty()) {
+                      webView.loadUrl(targetUrl)
+                  } else {
+                      webView.loadUrl("https://appassets.androidplatform.net/assets/www/index.html")
+                  }
+
+                  onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+                      override fun handleOnBackPressed() {
+                          if (webView.canGoBack()) {
+                              webView.goBack()
+                          } else {
+                              isEnabled = false
+                              onBackPressedDispatcher.onBackPressed()
+                          }
+                      }
+                  })
+              }
+          }
+          MAIN_KT
+
+      - name: 6. 配置 JDK 17 环境 (Set Up JDK 17)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 7. 配置 Gradle 并自动编译 APK (Setup Gradle & Assemble Debug APK)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: 8. 执行编译并收集 APK (Build APK)
+        shell: bash
+        run: |
+          set -e
+          if [ "${{ steps.detect.outputs.mode }}" == "android" ]; then
+            cd "${{ steps.detect.outputs.project_dir }}"
+          else
+            cd _android_webview
+          fi
+          gradle assembleDebug --no-daemon --stacktrace
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p output_apk
+          apk_file=$(find . -name "*-debug.apk" | head -n 1)
+          cp "$apk_file" output_apk/app-debug.apk
+          echo "成功生成 APK: output_apk/app-debug.apk"
+
+      - name: 9. 上传 APK 到 Actions 构件 (Upload APK Artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: output_apk/app-debug.apk
+
+      - name: 10. 自动发布到 GitHub Releases 供手机直接下载 (Publish APK to Releases)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: "自动编译 APK (Build #${{ github.run_number }})"
+          body: "手机浏览器请直接点击下方 Assets 中的 `app-debug.apk` 下载并安装。"
+          files: output_apk/app-debug.apk
